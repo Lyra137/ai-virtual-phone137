@@ -123,15 +123,10 @@ export const MessageBubble = memo(function MessageBubble({ msg, onUpdate, charNa
             if (msg.mediaType?.startsWith("plugin:")) {
                 return <PluginKindBubble msg={msg} kind={msg.mediaType.slice("plugin:".length)} />;
             }
-            const textBubbleContent = displayContent ?? msg.content;
-            const speechText = normalizeTextBubbleContent(textBubbleContent);
-            const textBubble = <TextBubble content={textBubbleContent} onActionSelect={onActionSelect} defaultTranslationExpanded={defaultTranslationExpanded} />;
+            const textBubble = <TextBubble content={displayContent ?? msg.content} onActionSelect={onActionSelect} characterId={characterId} msgId={msg.id} defaultTranslationExpanded={defaultTranslationExpanded} />;
             return (
                 <>
                     {textBubble}
-                    {characterId && msg.role !== "user" && speechText && (
-                        <TextSpeechButton characterId={characterId} msgId={msg.id} text={speechText} />
-                    )}
                     <ChatPluginSlot name="message.footer" slotProps={{ sessionId: msg.sessionId, message: msg }} className="chat-plugin-message-footer" />
                 </>
             );
@@ -485,10 +480,14 @@ function MarkdownTextContent({
     content,
     onActionSelect,
     htmlFrameVariant,
+    characterId,
+    msgId,
 }: {
     content: string;
     onActionSelect?: (text: string) => void;
     htmlFrameVariant?: ChatHtmlFrameVariant;
+    characterId?: string;
+    msgId?: string;
 }) {
     const containerRef = useRef<HTMLDivElement>(null);
 
@@ -532,16 +531,12 @@ function MarkdownTextContent({
     if (!hasHtmlBlocks) {
         // Simple path: pure markdown — extract styles only from non-html content
         const { styles, body } = extractStyles(cleaned);
-        const mdCleaned = wrapQuotedDialogue(linkifyBareUrls(stripPaySchemeUrls(body.trim())));
-        if (!mdCleaned && !styles && payUrls.length === 0) return null;
+        const mdSource = linkifyBareUrls(stripPaySchemeUrls(body.trim()));
+        if (!mdSource && !styles && payUrls.length === 0) return null;
         return (
             <div className="chat-markdown hide-scrollbar break-words" ref={containerRef}>
                 {styles && <style dangerouslySetInnerHTML={{ __html: styles }} />}
-                {mdCleaned && (
-                    <ReactMarkdown remarkPlugins={[remarkGfm, remarkBreaks]} rehypePlugins={[rehypeRaw]} components={MARKDOWN_COMPONENTS}>
-                        {mdCleaned}
-                    </ReactMarkdown>
-                )}
+                {mdSource && renderDialogueAwareContent(mdSource, characterId, msgId)}
                 {payUrls.map((u, i) => <ScanPayCard key={`pay-${i}`} url={u} />)}
             </div>
         );
@@ -556,15 +551,11 @@ function MarkdownTextContent({
                 }
                 // Extract styles only from markdown segments (not from html blocks)
                 const { styles, body } = extractStyles(seg.content);
-                const mdContent = wrapQuotedDialogue(linkifyBareUrls(stripPaySchemeUrls(body.trim())));
+                const mdContent = linkifyBareUrls(stripPaySchemeUrls(body.trim()));
                 return (
                     <div key={`md-${i}`}>
                         {styles && <style dangerouslySetInnerHTML={{ __html: styles }} />}
-                        {mdContent && (
-                            <ReactMarkdown remarkPlugins={[remarkGfm, remarkBreaks]} rehypePlugins={[rehypeRaw]} components={MARKDOWN_COMPONENTS}>
-                                {mdContent}
-                            </ReactMarkdown>
-                        )}
+                        {mdContent && renderDialogueAwareContent(mdContent, characterId, msgId, `md-${i}`)}
                     </div>
                 );
             })}
@@ -591,6 +582,8 @@ export const BilingualTextBlock = memo(function BilingualTextBlock({
     className,
     defaultExpanded = false,
     htmlFrameVariant,
+    characterId,
+    msgId,
 }: {
     text: string;
     onActionSelect?: (text: string) => void;
@@ -598,6 +591,8 @@ export const BilingualTextBlock = memo(function BilingualTextBlock({
     className?: string;
     defaultExpanded?: boolean;
     htmlFrameVariant?: ChatHtmlFrameVariant;
+    characterId?: string;
+    msgId?: string;
 }) {
     const bilingual = splitBilingualText(text);
     const [expanded, setExpanded] = useState(defaultExpanded);
@@ -608,7 +603,7 @@ export const BilingualTextBlock = memo(function BilingualTextBlock({
         if (mode === "plain") return <PlainTextContent content={content} className={extraClass} />;
         return (
             <div className={extraClass}>
-                <MarkdownTextContent content={content} onActionSelect={onActionSelect} htmlFrameVariant={htmlFrameVariant} />
+                <MarkdownTextContent content={content} onActionSelect={onActionSelect} htmlFrameVariant={htmlFrameVariant} characterId={characterId} msgId={msgId} />
             </div>
         );
     };
@@ -645,39 +640,94 @@ export const BilingualTextBlock = memo(function BilingualTextBlock({
     );
 });
 
-function TextBubble({ content, onActionSelect, defaultTranslationExpanded = false }: { content: string; onActionSelect?: (text: string) => void; defaultTranslationExpanded?: boolean }) {
-    return <BilingualTextBlock text={content} onActionSelect={onActionSelect} mode="markdown" defaultExpanded={defaultTranslationExpanded} />;
+function TextBubble({ content, onActionSelect, characterId, msgId, defaultTranslationExpanded = false }: { content: string; onActionSelect?: (text: string) => void; characterId?: string; msgId?: string; defaultTranslationExpanded?: boolean }) {
+    return <BilingualTextBlock text={content} onActionSelect={onActionSelect} mode="markdown" characterId={characterId} msgId={msgId} defaultExpanded={defaultTranslationExpanded} />;
 }
 
-// ── 文本消息朗读按钮 ─────────────────────────────
-// 让普通文本消息也像语音条一样可以点一下朗读：点击时用该角色绑定的语音配置
-// 现场合成一次并播放。同一消息同一文本只合成一次（模块级内存缓存，刷新页面后
-// 需重新合成；不写入消息 mediaData，避免污染消息数据）。与语音条共用 tts-service。
+// ── 台词级语音条 ─────────────────────────────
+// 把文本里用 “…” 或 「…」 括起来的角色台词，渲染成可点击播放的小语音条。
+// 点击时用该角色绑定的语音配置现场合成一次并播放；同一句同一文本只合成一次
+// （模块级内存缓存，刷新页面后重新合成，不写入消息数据）。与语音条共用 tts-service。
 
-const _textSpeechCache = new Map<string, Blob>();
+const _dialogueSpeechCache = new Map<string, Blob>();
+let _dialogueStylesInjected = false;
 
-function stripMarkdownForSpeech(text: string): string {
-    return text
-        .replace(/```[\s\S]*?```/g, " ")
-        .replace(/`[^`\n]*`/g, " ")
-        .replace(/<\/?[a-z][^>]*>/gi, " ")
-        .replace(/[#>*_~\[\]()!|]/g, "")
-        .replace(/\s+/g, " ")
-        .trim();
+function ensureDialogueSpeechStyles(): void {
+    if (_dialogueStylesInjected || typeof document === "undefined") return;
+    _dialogueStylesInjected = true;
+    const style = document.createElement("style");
+    style.textContent = "@keyframes chatDialogueBarPlay{0%,100%{transform:scaleY(.5)}50%{transform:scaleY(1)}}";
+    document.head.appendChild(style);
 }
 
-function TextSpeechButton({ characterId, msgId, text }: { characterId: string; msgId: string; text: string }) {
+/** 台词切分：代码块/行内代码之外、且跳过 HTML 标签内部的引号内容才识别为台词 */
+function splitDialogueSegments(text: string): Array<{ type: "text" | "speech"; content: string }> {
+    const out: Array<{ type: "text" | "speech"; content: string }> = [];
+    const parts = text.split(/(```[\s\S]*?```|`[^`\n]*`)/g);
+    for (const part of parts) {
+        if (!part) continue;
+        if (part.startsWith("`")) { out.push({ type: "text", content: part }); continue; }
+        let last = 0;
+        const rx = /(“[^”\n]{1,140}”|「[^」\n]{1,140}」)/g;
+        let m: RegExpExecArray | null;
+        while ((m = rx.exec(part)) !== null) {
+            if (m.index > last) out.push({ type: "text", content: part.slice(last, m.index) });
+            out.push({ type: "speech", content: m[1].slice(1, -1) });
+            last = m.index + m[0].length;
+        }
+        if (last < part.length) out.push({ type: "text", content: part.slice(last) });
+    }
+    return out.filter(s => s.type === "speech" || s.content.length > 0);
+}
+
+/** 段落文本渲染：文本块保留 markdown，台词块渲染为语音条 */
+function renderDialogueAwareContent(source: string, characterId?: string, msgId?: string, keyBase = "md") {
+    const segments = splitDialogueSegments(source);
+    return segments.map((seg, i) => {
+        if (seg.type === "speech") {
+            return (
+                <DialogueSpeechBubble
+                    key={`${keyBase}-speech-${i}`}
+                    characterId={characterId}
+                    msgId={msgId}
+                    text={seg.content}
+                />
+            );
+        }
+        const text = wrapQuotedDialogue(seg.content);
+        if (!text.trim()) return null;
+        if (/[#*_~`\[\]<>]/.test(text)) {
+            return (
+                <ReactMarkdown
+                    key={`${keyBase}-md-${i}`}
+                    remarkPlugins={[remarkGfm, remarkBreaks]}
+                    rehypePlugins={[rehypeRaw]}
+                    components={MARKDOWN_COMPONENTS}
+                >
+                    {text}
+                </ReactMarkdown>
+            );
+        }
+        return <span key={`${keyBase}-txt-${i}`} className="chat-dialogue-text">{text}</span>;
+    });
+}
+
+function DialogueSpeechBubble({ characterId, msgId, text }: { characterId?: string; msgId?: string; text: string }) {
     const [state, setState] = useState<"idle" | "loading" | "playing">("idle");
     const [hint, setHint] = useState("");
     const abortRef = useRef<(() => void) | null>(null);
     const hintTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
     useEffect(() => {
+        ensureDialogueSpeechStyles();
         return () => {
             abortRef.current?.();
             if (hintTimerRef.current) clearTimeout(hintTimerRef.current);
         };
     }, []);
+
+    const duration = Math.max(2, Math.ceil(text.length / 5));
+    const bars = [9, 13, 7, 15, 10];
 
     const handleClick = useCallback(async (e: React.MouseEvent) => {
         e.stopPropagation();
@@ -687,9 +737,7 @@ function TextSpeechButton({ characterId, msgId, text }: { characterId: string; m
             setState("idle");
             return;
         }
-        if (state === "loading") return;
-        const speechText = stripMarkdownForSpeech(text);
-        if (!speechText) return;
+        if (state === "loading" || !characterId || !msgId) return;
         setState("loading");
         const flash = (msg: string) => {
             setHint(msg);
@@ -704,12 +752,12 @@ function TextSpeechButton({ characterId, msgId, text }: { characterId: string; m
                 flash("未绑定语音配置，请先在 设置 → 语音 API 配置");
                 return;
             }
-            const key = `${msgId}|${speechText}`;
-            let blob = _textSpeechCache.get(key) ?? null;
+            const key = `${msgId}|${text}`;
+            let blob = _dialogueSpeechCache.get(key) ?? null;
             if (!blob) {
-                blob = await synthesizeSpeech(speechText, vc);
+                blob = await synthesizeSpeech(text, vc);
                 if (!blob) throw new Error("合成失败");
-                _textSpeechCache.set(key, blob);
+                _dialogueSpeechCache.set(key, blob);
             }
             const { promise, abort } = playAudioBlob(blob);
             abortRef.current = abort;
@@ -725,40 +773,77 @@ function TextSpeechButton({ characterId, msgId, text }: { characterId: string; m
 
     return (
         <span
-            className="chat-text-speech"
-            style={{ display: "inline-flex", alignItems: "center", gap: 6, marginTop: 6, verticalAlign: "middle" }}
+            className="chat-dialogue-speech"
+            onClick={handleClick}
+            role="button"
+            title="点击播放台词"
+            style={{
+                display: "inline-flex",
+                alignItems: "center",
+                gap: 7,
+                margin: "3px 4px",
+                padding: "4px 10px 4px 6px",
+                borderRadius: 999,
+                background: "var(--c-input, rgba(0,0,0,0.06))",
+                cursor: "pointer",
+                userSelect: "none",
+                maxWidth: 220,
+                verticalAlign: "middle",
+            }}
         >
-            <button
-                type="button"
-                className="chat-text-speech-btn"
-                onClick={handleClick}
-                aria-label="朗读本条消息"
-                title="朗读"
+            <span
                 style={{
-                    width: 26,
-                    height: 26,
-                    borderRadius: "50%",
-                    border: "none",
-                    cursor: "pointer",
-                    padding: 0,
                     display: "inline-flex",
                     alignItems: "center",
                     justifyContent: "center",
-                    background: "var(--c-input, rgba(0,0,0,0.06))",
-                    color: "var(--c-icon)",
-                    opacity: state === "loading" ? 0.6 : 1,
+                    width: 22,
+                    height: 22,
+                    borderRadius: "50%",
                     flexShrink: 0,
+                    background: "var(--c-accent, rgba(0,0,0,0.08))",
+                    color: "var(--c-text-title)",
                 }}
             >
                 {state === "loading" ? (
-                    <svg width="13" height="13" viewBox="0 0 24 24" className="animate-spin" fill="none" stroke="currentColor" strokeWidth="2"><path d="M12 2a10 10 0 0 1 10 10" strokeLinecap="round" /></svg>
+                    <svg width="12" height="12" viewBox="0 0 24 24" className="animate-spin" fill="none" stroke="currentColor" strokeWidth="2"><path d="M12 2a10 10 0 0 1 10 10" strokeLinecap="round" /></svg>
                 ) : state === "playing" ? (
-                    <svg width="13" height="13" viewBox="0 0 24 24" fill="currentColor"><rect x="6" y="4" width="4" height="16" rx="1" /><rect x="14" y="4" width="4" height="16" rx="1" /></svg>
+                    <svg width="12" height="12" viewBox="0 0 24 24" fill="currentColor"><rect x="6" y="4" width="4" height="16" rx="1" /><rect x="14" y="4" width="4" height="16" rx="1" /></svg>
                 ) : (
-                    <svg width="13" height="13" viewBox="0 0 24 24" fill="currentColor"><path d="M8 5v14l11-7z" /></svg>
+                    <svg width="12" height="12" viewBox="0 0 24 24" fill="currentColor"><path d="M8 5v14l11-7z" /></svg>
                 )}
-            </button>
-            {hint && <span style={{ fontSize: 11, color: "var(--c-icon)", lineHeight: 1.2 }}>{hint}</span>}
+            </span>
+            <span style={{ display: "inline-flex", alignItems: "flex-end", gap: 2, height: 15, flexShrink: 0 }}>
+                {bars.map((h, i) => (
+                    <span
+                        key={i}
+                        style={{
+                            width: 2,
+                            height: h,
+                            borderRadius: 1,
+                            background: state === "playing" ? "var(--c-accent, #7c9a92)" : "var(--c-icon)",
+                            transformOrigin: "bottom",
+                            animation: state === "playing" ? `chatDialogueBarPlay .8s ease-in-out ${i * 0.1}s infinite` : "none",
+                        }}
+                    />
+                ))}
+            </span>
+            <span
+                className="chat-dialogue-speech-text"
+                style={{
+                    fontSize: 12,
+                    lineHeight: 1.3,
+                    color: "var(--c-text)",
+                    overflow: "hidden",
+                    textOverflow: "ellipsis",
+                    whiteSpace: "nowrap",
+                    flex: "1 1 auto",
+                    minWidth: 0,
+                }}
+            >
+                {text}
+            </span>
+            <span style={{ fontSize: 11, color: "var(--c-icon)", flexShrink: 0 }}>{state === "playing" ? "播放中" : `${duration}"`}</span>
+            {hint && <span style={{ fontSize: 11, color: "var(--c-icon)", lineHeight: 1.2, flexShrink: 0 }}>{hint}</span>}
         </span>
     );
 }
