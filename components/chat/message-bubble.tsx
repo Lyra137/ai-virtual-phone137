@@ -122,10 +122,15 @@ export const MessageBubble = memo(function MessageBubble({ msg, onUpdate, charNa
             if (msg.mediaType?.startsWith("plugin:")) {
                 return <PluginKindBubble msg={msg} kind={msg.mediaType.slice("plugin:".length)} />;
             }
-            const textBubble = <TextBubble content={displayContent ?? msg.content} onActionSelect={onActionSelect} defaultTranslationExpanded={defaultTranslationExpanded} />;
+            const textBubbleContent = displayContent ?? msg.content;
+            const speechText = normalizeTextBubbleContent(textBubbleContent);
+            const textBubble = <TextBubble content={textBubbleContent} onActionSelect={onActionSelect} defaultTranslationExpanded={defaultTranslationExpanded} />;
             return (
                 <>
                     {textBubble}
+                    {characterId && msg.role !== "user" && speechText && (
+                        <TextSpeechButton characterId={characterId} msgId={msg.id} text={speechText} />
+                    )}
                     <ChatPluginSlot name="message.footer" slotProps={{ sessionId: msg.sessionId, message: msg }} className="chat-plugin-message-footer" />
                 </>
             );
@@ -641,6 +646,120 @@ export const BilingualTextBlock = memo(function BilingualTextBlock({
 
 function TextBubble({ content, onActionSelect, defaultTranslationExpanded = false }: { content: string; onActionSelect?: (text: string) => void; defaultTranslationExpanded?: boolean }) {
     return <BilingualTextBlock text={content} onActionSelect={onActionSelect} mode="markdown" defaultExpanded={defaultTranslationExpanded} />;
+}
+
+// ── 文本消息朗读按钮 ─────────────────────────────
+// 让普通文本消息也像语音条一样可以点一下朗读：点击时用该角色绑定的语音配置
+// 现场合成一次并播放。同一消息同一文本只合成一次（模块级内存缓存，刷新页面后
+// 需重新合成；不写入消息 mediaData，避免污染消息数据）。与语音条共用 tts-service。
+
+const _textSpeechCache = new Map<string, Blob>();
+
+function stripMarkdownForSpeech(text: string): string {
+    return text
+        .replace(/```[\s\S]*?```/g, " ")
+        .replace(/`[^`\n]*`/g, " ")
+        .replace(/<\/?[a-z][^>]*>/gi, " ")
+        .replace(/[#>*_~\[\]()!|]/g, "")
+        .replace(/\s+/g, " ")
+        .trim();
+}
+
+function TextSpeechButton({ characterId, msgId, text }: { characterId: string; msgId: string; text: string }) {
+    const [state, setState] = useState<"idle" | "loading" | "playing">("idle");
+    const [hint, setHint] = useState("");
+    const abortRef = useRef<(() => void) | null>(null);
+    const hintTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+    useEffect(() => {
+        return () => {
+            abortRef.current?.();
+            if (hintTimerRef.current) clearTimeout(hintTimerRef.current);
+        };
+    }, []);
+
+    const handleClick = useCallback(async (e: React.MouseEvent) => {
+        e.stopPropagation();
+        if (state === "playing") {
+            abortRef.current?.();
+            abortRef.current = null;
+            setState("idle");
+            return;
+        }
+        if (state === "loading") return;
+        const speechText = stripMarkdownForSpeech(text);
+        if (!speechText) return;
+        setState("loading");
+        const flash = (msg: string) => {
+            setHint(msg);
+            if (hintTimerRef.current) clearTimeout(hintTimerRef.current);
+            hintTimerRef.current = setTimeout(() => setHint(""), 3200);
+        };
+        try {
+            const { resolveVoiceConfig, synthesizeSpeech, playAudioBlob } = await import("@/lib/tts-service");
+            const vc = resolveVoiceConfig(characterId);
+            if (!vc) {
+                setState("idle");
+                flash("未绑定语音配置，请先在 设置 → 语音 API 配置");
+                return;
+            }
+            const key = `${msgId}|${speechText}`;
+            let blob = _textSpeechCache.get(key) ?? null;
+            if (!blob) {
+                blob = await synthesizeSpeech(speechText, vc);
+                if (!blob) throw new Error("合成失败");
+                _textSpeechCache.set(key, blob);
+            }
+            const { promise, abort } = playAudioBlob(blob);
+            abortRef.current = abort;
+            setState("playing");
+            await promise;
+            if (abortRef.current === abort) abortRef.current = null;
+            setState("idle");
+        } catch {
+            setState("idle");
+            flash("语音合成失败，请检查语音 API 配置");
+        }
+    }, [characterId, msgId, text, state]);
+
+    return (
+        <span
+            className="chat-text-speech"
+            style={{ display: "inline-flex", alignItems: "center", gap: 6, marginTop: 6, verticalAlign: "middle" }}
+        >
+            <button
+                type="button"
+                className="chat-text-speech-btn"
+                onClick={handleClick}
+                aria-label="朗读本条消息"
+                title="朗读"
+                style={{
+                    width: 26,
+                    height: 26,
+                    borderRadius: "50%",
+                    border: "none",
+                    cursor: "pointer",
+                    padding: 0,
+                    display: "inline-flex",
+                    alignItems: "center",
+                    justifyContent: "center",
+                    background: "var(--c-input, rgba(0,0,0,0.06))",
+                    color: "var(--c-icon)",
+                    opacity: state === "loading" ? 0.6 : 1,
+                    flexShrink: 0,
+                }}
+            >
+                {state === "loading" ? (
+                    <svg width="13" height="13" viewBox="0 0 24 24" className="animate-spin" fill="none" stroke="currentColor" strokeWidth="2"><path d="M12 2a10 10 0 0 1 10 10" strokeLinecap="round" /></svg>
+                ) : state === "playing" ? (
+                    <svg width="13" height="13" viewBox="0 0 24 24" fill="currentColor"><rect x="6" y="4" width="4" height="16" rx="1" /><rect x="14" y="4" width="4" height="16" rx="1" /></svg>
+                ) : (
+                    <svg width="13" height="13" viewBox="0 0 24 24" fill="currentColor"><path d="M8 5v14l11-7z" /></svg>
+                )}
+            </button>
+            {hint && <span style={{ fontSize: 11, color: "var(--c-icon)", lineHeight: 1.2 }}>{hint}</span>}
+        </span>
+    );
 }
 
 // ── Red Packet ─────────────────────────────
