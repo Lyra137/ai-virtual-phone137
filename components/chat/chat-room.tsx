@@ -152,19 +152,25 @@ function hasOfflineHtmlPreview(text: string): boolean {
 const OfflineAssistantTextBlock = memo(function OfflineAssistantTextBlock({
     text,
     defaultExpanded,
+    characterId,
+    voiceKey,
 }: {
     text: string;
     defaultExpanded: boolean;
+    /** 传入后，线下正文里的 “台词” / 「台词」 会带上「听语音」按钮 */
+    characterId?: string;
+    /** 语音缓存键（线下用轮次 id，同一轮同一句只合成一次） */
+    voiceKey?: string;
 }) {
     const paragraphs = useMemo(() => splitOfflineParagraphs(text), [text]);
     if (paragraphs.length <= 1) {
-        return <BilingualTextBlock text={text} mode="markdown" defaultExpanded={defaultExpanded} htmlFrameVariant="offline" />;
+        return <BilingualTextBlock text={text} mode="markdown" defaultExpanded={defaultExpanded} htmlFrameVariant="offline" characterId={characterId} voiceKey={voiceKey} />;
     }
     return (
         <div className="chat-offline-paragraph-stack">
             {paragraphs.map((paragraph, index) => (
                 <div className="chat-offline-paragraph" key={`${index}-${paragraph.slice(0, 16)}`}>
-                    <BilingualTextBlock text={paragraph} mode="markdown" defaultExpanded={defaultExpanded} htmlFrameVariant="offline" />
+                    <BilingualTextBlock text={paragraph} mode="markdown" defaultExpanded={defaultExpanded} htmlFrameVariant="offline" characterId={characterId} voiceKey={voiceKey} />
                 </div>
             ))}
         </div>
@@ -5585,6 +5591,8 @@ export function ChatRoom({ session, onBack, onDeleted }: ChatRoomProps) {
                                         <OfflineAssistantTextBlock
                                             text={offlineDisplay.assistantContent}
                                             defaultExpanded={session.collapseBilingualTranslation !== false ? false : true}
+                                            characterId={session.isGroup ? undefined : session.contactId}
+                                            voiceKey={turn.id}
                                         />
                                     </div>
                                     {turn.summary.trim() && (

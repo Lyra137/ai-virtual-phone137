@@ -127,7 +127,9 @@ export const MessageBubble = memo(function MessageBubble({ msg, onUpdate, charNa
             if (msg.mediaType?.startsWith("plugin:")) {
                 return <PluginKindBubble msg={msg} kind={msg.mediaType.slice("plugin:".length)} />;
             }
-            const textBubble = <TextBubble content={displayContent ?? msg.content} onActionSelect={onActionSelect} defaultTranslationExpanded={defaultTranslationExpanded} />;
+            // 台词语音按钮：只给非用户消息挂（用户自己的话不朗读）
+            const dialogueVoiceCharacterId = msg.role === "user" ? undefined : characterId;
+            const textBubble = <TextBubble content={displayContent ?? msg.content} onActionSelect={onActionSelect} characterId={dialogueVoiceCharacterId} voiceKey={msg.id} defaultTranslationExpanded={defaultTranslationExpanded} />;
             return (
                 <>
                     {textBubble}
@@ -480,16 +482,157 @@ const MARKDOWN_COMPONENTS = {
     content: ({ node, ...props }: any) => <div className="rm-content" {...props} />
 } as any;
 
+// ── 对白语音（点一下听这句台词） ─────────────────────────────
+// 文本里用 “…” / 「…」 / 『…』 括起来的台词，已被 wrapQuotedDialogue 包成 <q>。
+// 这里把 <q> 渲染成「台词 + 播放按钮」：点击用该角色绑定的语音配置现场合成这句台词
+// 并播放。同一句同一文本只合成一次（模块级内存缓存，刷新页面后重新合成，不写入消息
+// 数据）。线上气泡与线下正文共用同一套渲染，所以两边同时生效。
+//
+// 只有拿到 characterId（能解析出语音配置）时才挂按钮：漫卷等复用 BilingualTextBlock
+// 的地方不带这个参数，行为完全不变。
+
+const _dialogueVoiceCache = new Map<string, Blob>();
+
+/** 从 React 子节点里取出纯文本（<q> 内一般就是一段文本，兼容嵌套数组） */
+function collectNodeText(node: React.ReactNode): string {
+    if (node === null || node === undefined || typeof node === "boolean") return "";
+    if (typeof node === "string" || typeof node === "number") return String(node);
+    if (Array.isArray(node)) return node.map(collectNodeText).join("");
+    const props = (node as { props?: { children?: React.ReactNode } }).props;
+    return props ? collectNodeText(props.children) : "";
+}
+
+function DialogueVoiceQuote({ characterId, voiceKey, children, node: _node, ...props }: any) {
+    const [state, setState] = useState<"idle" | "loading" | "playing">("idle");
+    const [hint, setHint] = useState("");
+    const abortRef = useRef<(() => void) | null>(null);
+    const hintTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+    useEffect(() => () => {
+        abortRef.current?.();
+        if (hintTimerRef.current) clearTimeout(hintTimerRef.current);
+    }, []);
+
+    // 朗读内容 = 台词文本去掉两端引号
+    const speechText = useMemo(
+        () => collectNodeText(children).trim().replace(/^[“”「」『』"'\s]+|[“”「」『』"'\s]+$/g, "").trim(),
+        [children],
+    );
+
+    const handlePlay = useCallback(async (event: React.MouseEvent) => {
+        event.preventDefault();
+        event.stopPropagation();
+        if (state === "playing") {
+            abortRef.current?.();
+            abortRef.current = null;
+            setState("idle");
+            return;
+        }
+        if (state === "loading" || !speechText) return;
+        setState("loading");
+        const flash = (message: string) => {
+            setHint(message);
+            if (hintTimerRef.current) clearTimeout(hintTimerRef.current);
+            hintTimerRef.current = setTimeout(() => setHint(""), 3200);
+        };
+        try {
+            const { resolveVoiceConfig, synthesizeSpeech, playAudioBlob, unlockAudioPlayback } = await import("@/lib/tts-service");
+            // 播放发生在点击手势内，先解锁音频上下文（iOS 上更稳）
+            unlockAudioPlayback();
+            const voiceConfig = resolveVoiceConfig(characterId, "chat");
+            if (!voiceConfig || !voiceConfig.enableTTS) {
+                setState("idle");
+                flash("未绑定或未启用语音配置（设置 → 绑定 → 聊天）");
+                return;
+            }
+            const cacheKey = `${voiceKey}|${speechText}`;
+            let blob = _dialogueVoiceCache.get(cacheKey) ?? null;
+            if (!blob) {
+                blob = await synthesizeSpeech(speechText, voiceConfig);
+                if (!blob) throw new Error("合成失败");
+                _dialogueVoiceCache.set(cacheKey, blob);
+            }
+            const { promise, abort } = playAudioBlob(blob);
+            abortRef.current = abort;
+            setState("playing");
+            await promise;
+            if (abortRef.current === abort) abortRef.current = null;
+            setState("idle");
+        } catch {
+            setState("idle");
+            flash("语音合成失败，请检查语音配置");
+        }
+    }, [characterId, speechText, state, voiceKey]);
+
+    return (
+        <q {...props}>
+            <button
+                type="button"
+                className="chat-dialogue-voice-btn"
+                data-state={state}
+                onClick={handlePlay}
+                onPointerDown={(e) => e.stopPropagation()}
+                onPointerUp={(e) => e.stopPropagation()}
+                onContextMenu={(e) => e.stopPropagation()}
+                aria-label="播放这句台词"
+                title={hint || "播放这句台词"}
+                style={{
+                    display: "inline-flex",
+                    alignItems: "center",
+                    justifyContent: "center",
+                    width: 18,
+                    height: 18,
+                    minHeight: 18,
+                    padding: 0,
+                    marginRight: 4,
+                    borderRadius: "50%",
+                    border: "none",
+                    cursor: "pointer",
+                    verticalAlign: "-3px",
+                    background: "var(--c-input)",
+                    color: "var(--c-icon)",
+                    opacity: state === "loading" ? 0.55 : 1,
+                    flexShrink: 0,
+                }}
+            >
+                {state === "loading" ? (
+                    <svg width="9" height="9" viewBox="0 0 24 24" className="animate-spin" fill="none" stroke="currentColor" strokeWidth="3" aria-hidden="true"><path d="M12 2a10 10 0 0 1 10 10" strokeLinecap="round" /></svg>
+                ) : state === "playing" ? (
+                    <svg width="9" height="9" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><rect x="6" y="4" width="4" height="16" rx="1" /><rect x="14" y="4" width="4" height="16" rx="1" /></svg>
+                ) : (
+                    <svg width="9" height="9" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M8 5v14l11-7z" /></svg>
+                )}
+            </button>
+            {children}
+        </q>
+    );
+}
+
 function MarkdownTextContent({
     content,
     onActionSelect,
     htmlFrameVariant,
+    characterId,
+    voiceKey,
 }: {
     content: string;
     onActionSelect?: (text: string) => void;
     htmlFrameVariant?: ChatHtmlFrameVariant;
+    characterId?: string;
+    voiceKey?: string;
 }) {
     const containerRef = useRef<HTMLDivElement>(null);
+
+    // 有角色时：把台词 <q> 换成带播放按钮的版本（线下正文/线上气泡共用）
+    const markdownComponents = useMemo(
+        () => (characterId
+            ? {
+                ...MARKDOWN_COMPONENTS,
+                q: (props: any) => <DialogueVoiceQuote characterId={characterId} voiceKey={voiceKey || ""} {...props} />,
+            }
+            : MARKDOWN_COMPONENTS),
+        [characterId, voiceKey],
+    );
 
     // Action delegate for data-action clicks in inline HTML
     useEffect(() => {
@@ -537,7 +680,7 @@ function MarkdownTextContent({
             <div className="chat-markdown hide-scrollbar break-words" ref={containerRef}>
                 {styles && <style dangerouslySetInnerHTML={{ __html: styles }} />}
                 {mdCleaned && (
-                    <ReactMarkdown remarkPlugins={[remarkGfm, remarkBreaks, remarkCjkFriendly]} rehypePlugins={[rehypeRaw]} components={MARKDOWN_COMPONENTS}>
+                    <ReactMarkdown remarkPlugins={[remarkGfm, remarkBreaks, remarkCjkFriendly]} rehypePlugins={[rehypeRaw]} components={markdownComponents}>
                         {mdCleaned}
                     </ReactMarkdown>
                 )}
@@ -560,7 +703,7 @@ function MarkdownTextContent({
                     <div key={`md-${i}`}>
                         {styles && <style dangerouslySetInnerHTML={{ __html: styles }} />}
                         {mdContent && (
-                            <ReactMarkdown remarkPlugins={[remarkGfm, remarkBreaks, remarkCjkFriendly]} rehypePlugins={[rehypeRaw]} components={MARKDOWN_COMPONENTS}>
+                            <ReactMarkdown remarkPlugins={[remarkGfm, remarkBreaks, remarkCjkFriendly]} rehypePlugins={[rehypeRaw]} components={markdownComponents}>
                                 {mdContent}
                             </ReactMarkdown>
                         )}
@@ -590,6 +733,8 @@ export const BilingualTextBlock = memo(function BilingualTextBlock({
     className,
     defaultExpanded = false,
     htmlFrameVariant,
+    characterId,
+    voiceKey,
 }: {
     text: string;
     onActionSelect?: (text: string) => void;
@@ -597,6 +742,10 @@ export const BilingualTextBlock = memo(function BilingualTextBlock({
     className?: string;
     defaultExpanded?: boolean;
     htmlFrameVariant?: ChatHtmlFrameVariant;
+    /** 传入后，文本里的 “台词” / 「台词」 会带上「听语音」按钮 */
+    characterId?: string;
+    /** 语音缓存键（线下传轮次 id，线上传消息 id） */
+    voiceKey?: string;
 }) {
     const bilingual = splitBilingualText(text);
     const [expanded, setExpanded] = useState(defaultExpanded);
@@ -607,7 +756,7 @@ export const BilingualTextBlock = memo(function BilingualTextBlock({
         if (mode === "plain") return <PlainTextContent content={content} className={extraClass} />;
         return (
             <div className={extraClass}>
-                <MarkdownTextContent content={content} onActionSelect={onActionSelect} htmlFrameVariant={htmlFrameVariant} />
+                <MarkdownTextContent content={content} onActionSelect={onActionSelect} htmlFrameVariant={htmlFrameVariant} characterId={characterId} voiceKey={voiceKey} />
             </div>
         );
     };
@@ -644,8 +793,8 @@ export const BilingualTextBlock = memo(function BilingualTextBlock({
     );
 });
 
-function TextBubble({ content, onActionSelect, defaultTranslationExpanded = false }: { content: string; onActionSelect?: (text: string) => void; defaultTranslationExpanded?: boolean }) {
-    return <BilingualTextBlock text={content} onActionSelect={onActionSelect} mode="markdown" defaultExpanded={defaultTranslationExpanded} />;
+function TextBubble({ content, onActionSelect, characterId, voiceKey, defaultTranslationExpanded = false }: { content: string; onActionSelect?: (text: string) => void; characterId?: string; voiceKey?: string; defaultTranslationExpanded?: boolean }) {
+    return <BilingualTextBlock text={content} onActionSelect={onActionSelect} mode="markdown" characterId={characterId} voiceKey={voiceKey} defaultExpanded={defaultTranslationExpanded} />;
 }
 
 // ── Red Packet ─────────────────────────────

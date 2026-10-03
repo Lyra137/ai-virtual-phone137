@@ -25,6 +25,7 @@ export function resolveVoiceConfig(characterId: string, appId?: ContentAppId): V
  * Supported providers:
  * - Minimax: REST API → hex-encoded mp3
  * - OpenAI: REST API → binary audio blob
+ * - ElevenLabs: REST API → binary audio/mpeg
  */
 export async function synthesizeSpeech(
     text: string,
@@ -41,6 +42,10 @@ export async function synthesizeSpeech(
 
     if (provider === "OpenAI") {
         return synthesizeOpenAI(text, voiceConfig);
+    }
+
+    if (provider === "ElevenLabs") {
+        return synthesizeElevenLabs(text, voiceConfig);
     }
 
     return null;
@@ -168,6 +173,59 @@ async function synthesizeOpenAI(text: string, config: VoiceApiConfig): Promise<B
     if (!response.ok) {
         const errText = await response.text().catch(() => "");
         throw new Error(`OpenAI TTS 请求失败 (${response.status}): ${errText}`);
+    }
+
+    const blob = await response.blob();
+    return new Blob([await blob.arrayBuffer()], { type: "audio/mpeg" });
+}
+
+// ── ElevenLabs TTS ──────────────────────────────────
+// 官方接口 v1/text-to-speech/{voice_id}，认证头是 xi-api-key（不是 Bearer），
+// 直接返回二进制 audio/mpeg。音色 ID 填在「默认音色」一栏即可（支持克隆音色 ID）。
+// 语速等 voice_settings 不从这里下发：部分旧模型不接受 speed 参数会直接 400，
+// 保持纯文本请求最稳；需要语速可换模型或后续单独接。
+export const ELEVENLABS_DEFAULT_BASE_URL = "https://api.elevenlabs.io/v1";
+
+async function synthesizeElevenLabs(text: string, config: VoiceApiConfig): Promise<Blob | null> {
+    if (!config.apiKey) throw new Error("ElevenLabs API Key 未配置");
+
+    const voiceId = (config.defaultVoice || "").trim();
+    if (!voiceId) throw new Error("ElevenLabs 需要填写 Voice ID（在 ElevenLabs 音色页复制）");
+
+    const baseUrl = (config.baseUrl || ELEVENLABS_DEFAULT_BASE_URL).replace(/\/$/, "");
+    const response = await fetchWithTimeout(`${baseUrl}/text-to-speech/${encodeURIComponent(voiceId)}`, {
+        method: "POST",
+        headers: {
+            "xi-api-key": config.apiKey.trim(),
+            "Content-Type": "application/json",
+            Accept: "audio/mpeg",
+        },
+        body: JSON.stringify({
+            text,
+            model_id: config.model || "eleven_multilingual_v2",
+            voice_settings: {
+                stability: 0.5,
+                similarity_boost: 0.75,
+            },
+        }),
+    });
+
+    if (!response.ok) {
+        const errText = await response.text().catch(() => "");
+        // 官方错误体形如 { detail: { status, message } }，也可能 detail 直接是字符串
+        let message = "";
+        try {
+            const parsed = JSON.parse(errText) as { detail?: unknown; message?: unknown };
+            const detail = parsed?.detail;
+            if (detail && typeof detail === "object") {
+                message = String((detail as { message?: unknown }).message || "");
+            } else if (typeof detail === "string") {
+                message = detail;
+            } else {
+                message = String(parsed?.message || "");
+            }
+        } catch { /* 非 JSON 就退回原文 */ }
+        throw new Error(`ElevenLabs TTS 请求失败 (${response.status}): ${String(message || errText).slice(0, 300)}`);
     }
 
     const blob = await response.blob();
